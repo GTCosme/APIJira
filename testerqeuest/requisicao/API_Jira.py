@@ -1,46 +1,43 @@
 import csv
 import json
+import os
 import re
 import time
-import os
 import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
 import keyring
-# =========================
-# CONFIG
-# =========================
 
+# =========================================================
+# CONFIG
+# =========================================================
 SERVICE = "jira_cnpem"
 
 EMAIL = keyring.get_password(SERVICE, "email")
 BASE = keyring.get_password(SERVICE, "base")
-API_TOKEN = keyring.get_password(SERVICE, EMAIL if EMAIL else "")
+API_TOKEN = keyring.get_password(SERVICE, EMAIL or "")
 
 if not EMAIL or not BASE or not API_TOKEN:
     raise RuntimeError(
-        "Credenciais do Jira não encontradas no keyring. "
-        "Execute o script de setup."
+        "Credenciais do Jira não encontradas no keyring.\n"
+        "Esperado no keyring:\n"
+        f"- service={SERVICE}, username=email  -> value=<seu email>\n"
+        f"- service={SERVICE}, username=base   -> value=https://cnpem.atlassian.net\n"
+        f"- service={SERVICE}, username=<email> -> value=<api_token>\n"
     )
-
 
 JQL = "project = IINFRA ORDER BY Rank ASC"
 PAGE_SIZE = 200
 
 OUT_FIELDS = "iinfra_field_dictionary.csv"
-OUT_CSV = "iinfra_organizado.csv"
+OUT_ISSUES = "iinfra_organizado.csv"
+OUT_ATTACH = "iinfra_attachments.csv"
 OUT_PARQUET = "iinfra_organizado.parquet"
 
-# NOVO: arquivo de anexos
-OUT_ATTACHMENTS = "iinfra_attachments.csv"
-
-# NOVO (opcional): baixar anexos?
 DOWNLOAD_ATTACHMENTS = False
 ATTACHMENTS_DIR = "attachments_download"
 
-auth = HTTPBasicAuth(EMAIL, API_TOKEN)
-headers = {"Accept": "application/json"}
-
+# Campos (nomes como aparecem na UI) que você quer garantir no export
 WANTED_UI_FIELDS = [
     "Team",
     "Unidade Requisitante",
@@ -62,6 +59,7 @@ WANTED_UI_FIELDS = [
     "servicedesk-approvals",
 ]
 
+# Ordem final das colunas do CSV de issues
 FINAL_COL_ORDER = [
     "key", "url",
     "project", "issuetype", "status", "priority",
@@ -77,17 +75,31 @@ FINAL_COL_ORDER = [
     "Work type id",
     "assignee", "reporter",
     "created", "updated",
-    "summary",
-    "description_text",
+    "summary", "description_text",
     "Observações",
-    # NOVO:
     "attachment_count",
 ]
 
-# =========================
-# HTTP helpers
-# =========================
-def req(method, url, *, params=None, max_retries=6):
+# Schema fixo para anexos
+ATTACH_COLS = [
+    "issueKey",
+    "attachmentId",
+    "filename",
+    "mimeType",
+    "size",
+    "created",
+    "author",
+    "contentUrl",
+    "thumbnailUrl",
+]
+
+auth = HTTPBasicAuth(EMAIL, API_TOKEN)
+headers = {"Accept": "application/json"}
+
+# =========================================================
+# HELPERS: HTTP
+# =========================================================
+def req_json(method, url, *, params=None, max_retries=6):
     for attempt in range(max_retries):
         r = requests.request(method, url, headers=headers, auth=auth, params=params)
 
@@ -113,11 +125,30 @@ def req(method, url, *, params=None, max_retries=6):
 
 
 def jira_get(path, params=None):
-    return req("GET", f"{BASE}{path}", params=params)
+    return req_json("GET", f"{BASE}{path}", params=params)
 
-# =========================
-# Normalização
-# =========================
+# =========================================================
+# HELPERS: NORMALIZAÇÃO
+# =========================================================
+def _sanitize_cell(v):
+    """Remove CR/LF e normaliza nulos -> string vazia.
+    Isso evita linha quebrada e deslocamento de colunas no CSV.
+    """
+    if v is None:
+        return ""
+    # pandas NA / nan
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+
+    s = str(v)
+    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
 def to_scalar(v):
     if v is None:
         return None
@@ -134,15 +165,9 @@ def to_scalar(v):
         return ", ".join(items) if items else None
     return str(v)
 
-def clean_cell_text(s):
-    if s is None:
-        return None
-    s = str(s)
-    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
 
 def parse_ptbr_number(s):
+    """Converte '1.234.567,89' / '150.000,00' / '57%' -> float"""
     if s is None:
         return None
     s = str(s).strip()
@@ -150,7 +175,6 @@ def parse_ptbr_number(s):
         return None
     s = s.replace("R$", "").replace("%", "").strip()
     s = re.sub(r"[^0-9\-,\.]", "", s)
-
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
     try:
@@ -158,7 +182,9 @@ def parse_ptbr_number(s):
     except ValueError:
         return None
 
+
 def adf_to_text(node):
+    """Extrai texto simples de ADF (description)."""
     if node is None:
         return ""
     if isinstance(node, list):
@@ -172,38 +198,64 @@ def adf_to_text(node):
         return adf_to_text(node.get("content", []))
     return str(node)
 
+
 def description_to_text(desc):
     if desc is None:
-        return None
+        return ""
     if isinstance(desc, str):
-        return clean_cell_text(desc)
+        return desc
     if isinstance(desc, dict):
-        return clean_cell_text(adf_to_text(desc))
-    return clean_cell_text(str(desc))
+        return adf_to_text(desc)
+    return str(desc)
 
-# =========================
-# Fields dictionary
-# =========================
+# =========================================================
+# CSV WRITER (ROBUSTO)
+# =========================================================
+def write_csv_dictrows(path, rows, fieldnames):
+    """Escreve CSV determinístico:
+    - sempre mesmas colunas e mesma ordem
+    - QUOTE_ALL
+    - lineterminator '\n'
+    - newline='' (evita linhas em branco no Windows)
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            delimiter=";",
+            quotechar='"',
+            quoting=csv.QUOTE_ALL,
+            lineterminator="\n",
+            escapechar="\\",
+            doublequote=True,
+            extrasaction="ignore",
+        )
+        w.writeheader()
+        for r in rows:
+            out = {k: _sanitize_cell(r.get(k)) for k in fieldnames}
+            w.writerow(out)
+
+# =========================================================
+# JIRA: FIELDS + SEARCH
+# =========================================================
 def fetch_fields_catalog():
+    """GET /rest/api/3/field/search paginado"""
     all_fields = []
     start_at = 0
     max_results = 100
-
     while True:
         data = jira_get("/rest/api/3/field/search", params={"startAt": start_at, "maxResults": max_results})
         values = data.get("values", [])
         all_fields.extend(values)
         start_at += len(values)
-
         if start_at >= data.get("total", 0) or len(values) == 0:
             break
-
     return all_fields
 
-# =========================
-# Search issues via NEW endpoint (GET)
-# =========================
+
 def search_all_issues(jql, fields_csv, expand="names,schema", page_size=100):
+    """GET /rest/api/3/search/jql com nextPageToken"""
     issues = []
     next_token = None
 
@@ -211,14 +263,13 @@ def search_all_issues(jql, fields_csv, expand="names,schema", page_size=100):
         params = {
             "jql": jql,
             "maxResults": page_size,
-            "fields": fields_csv,   # string "a,b,c"
+            "fields": fields_csv,
             "expand": expand,
         }
         if next_token:
             params["nextPageToken"] = next_token
 
         data = jira_get("/rest/api/3/search/jql", params=params)
-
         batch = data.get("issues", [])
         issues.extend(batch)
 
@@ -226,19 +277,18 @@ def search_all_issues(jql, fields_csv, expand="names,schema", page_size=100):
         next_token = data.get("nextPageToken")
 
         print(f"Baixando... acumulado={len(issues)} isLast={is_last}")
-
         if is_last or not next_token or len(batch) == 0:
             break
 
     return issues
 
-# =========================
-# (Opcional) Download de anexos
-# =========================
-def download_attachments(attachments_df, out_dir):
+# =========================================================
+# (Opcional) Download de anexos físicos
+# =========================================================
+def download_attachments(attach_rows, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
-    for _, row in attachments_df.iterrows():
+    for row in attach_rows:
         issue_key = row.get("issueKey")
         url = row.get("contentUrl")
         filename = row.get("filename")
@@ -247,7 +297,6 @@ def download_attachments(attachments_df, out_dir):
 
         issue_dir = os.path.join(out_dir, issue_key)
         os.makedirs(issue_dir, exist_ok=True)
-
         path = os.path.join(issue_dir, filename)
 
         r = requests.get(url, auth=auth, stream=True, headers={"Accept": "*/*"})
@@ -259,50 +308,58 @@ def download_attachments(attachments_df, out_dir):
 
     print("Download concluído em:", out_dir)
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
+    print("BASE:", BASE)
+    print("EMAIL:", EMAIL)
     print("JQL:", JQL)
 
-    # Catálogo de fields
+    # 1) Catálogo de campos (dicionário)
     fields_catalog = fetch_fields_catalog()
-    dict_df = pd.DataFrame([{
+    dict_rows = [{
         "fieldId": f.get("id"),
         "fieldName": f.get("name"),
         "custom": f.get("custom"),
         "schema": json.dumps(f.get("schema"), ensure_ascii=False),
-    } for f in fields_catalog])
-    dict_df.to_csv(OUT_FIELDS, index=False, encoding="utf-8-sig", sep=";", quoting=csv.QUOTE_ALL)
+    } for f in fields_catalog]
+
+    write_csv_dictrows(
+        OUT_FIELDS,
+        dict_rows,
+        fieldnames=["fieldId", "fieldName", "custom", "schema"],
+    )
     print("OK:", OUT_FIELDS)
 
     name_to_id = {f.get("name"): f.get("id") for f in fields_catalog if f.get("name") and f.get("id")}
 
-    # 2) Define fields a buscar
+    # 2) Fields a buscar (system + custom)
     system_fields = [
         "summary", "description", "status", "issuetype", "priority",
         "assignee", "reporter", "created", "updated", "duedate", "project",
-        "attachment",  # traz anexos
+        "attachment",
     ]
-
     custom_field_ids = [name_to_id.get(nm) for nm in WANTED_UI_FIELDS if name_to_id.get(nm)]
     fields_list = system_fields + custom_field_ids
 
     # remove duplicados preservando ordem
     seen = set()
     fields_list = [f for f in fields_list if not (f in seen or seen.add(f))]
-
     fields_csv = ",".join(fields_list)
 
-    #  Busca issues
+    # 3) Busca issues
     issues = search_all_issues(JQL, fields_csv, expand="names,schema", page_size=PAGE_SIZE)
 
-    # Monta dataframe de issues + dataframe de anexos
-    rows = []
-    attachments_rows = []
+    # 4) Monta linhas de issues + anexos
+    issue_rows = []
+    attach_rows = []
 
     for issue in issues:
         f = issue.get("fields", {})
         key = issue.get("key")
 
-        # --- issue row ---
+        # issue base
         row = {
             "key": key,
             "url": f"{BASE}/browse/{key}" if key else None,
@@ -315,16 +372,16 @@ def main():
             "created": f.get("created"),
             "updated": f.get("updated"),
             "duedate": f.get("duedate"),
-            "summary": clean_cell_text(f.get("summary")),
+            "summary": f.get("summary"),
             "description_text": description_to_text(f.get("description")),
         }
 
-        # Campos do board por nome da UI
+        # custom fields por nome da UI
         for ui_name in WANTED_UI_FIELDS:
             fid = name_to_id.get(ui_name)
-            row[ui_name] = clean_cell_text(to_scalar(f.get(fid))) if fid else None
+            row[ui_name] = to_scalar(f.get(fid)) if fid else None
 
-        # Numéricos prontos para BI
+        # numéricos prontos p/ BI
         row["Orçamento_num"] = parse_ptbr_number(row.get("Orçamento (R$)"))
         row["Expense_num"] = parse_ptbr_number(row.get("Expense (R$)"))
         row["Balance_num"] = parse_ptbr_number(row.get("Balance (R$)"))
@@ -332,66 +389,61 @@ def main():
         row["Orçamento_liberado_ano_num"] = parse_ptbr_number(row.get("Orçamento liberado no ano (R$)"))
         row["Execução_percent_num"] = parse_ptbr_number(row.get("% Execução"))
 
-        # --- anexos ---
+        # anexos
         attachments = f.get("attachment") or []
         row["attachment_count"] = len(attachments)
 
         for a in attachments:
-            attachments_rows.append({
+            attach_rows.append({
                 "issueKey": key,
                 "attachmentId": a.get("id"),
                 "filename": a.get("filename"),
                 "mimeType": a.get("mimeType"),
+                # size: manter como valor simples (vai como texto no CSV; você tipa no Power BI se quiser)
                 "size": a.get("size"),
                 "created": a.get("created"),
                 "author": (a.get("author") or {}).get("displayName"),
-                "contentUrl": a.get("content"),       # URL para download
+                "contentUrl": a.get("content"),
                 "thumbnailUrl": a.get("thumbnail"),
             })
 
-        rows.append(row)
+        issue_rows.append(row)
 
-    df = pd.DataFrame(rows)
-    attachments_df = pd.DataFrame(attachments_rows)
+    # 5) Ordena colunas das issues (as que faltarem vão pro final)
+    df_issues = pd.DataFrame(issue_rows)
+    issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
+    df_issues = df_issues[issue_cols]
 
-    # Reordena colunas do issues
-    col_order = [c for c in FINAL_COL_ORDER if c in df.columns] + [c for c in df.columns if c not in FINAL_COL_ORDER]
-    df = df[col_order]
+    # Converte de volta para rows (dicts) pra escrever com DictWriter robusto
+    issue_rows_out = df_issues.to_dict(orient="records")
 
-    #  Export issues organizado
-    df.to_csv(
-        OUT_CSV,
-        index=False,
-        sep=";",
-        encoding="utf-8-sig",
-        quoting=csv.QUOTE_ALL,
-        lineterminator="\n"
-    )
-    print("OK:", OUT_CSV)
+    # 6) Export issues (robusto)
+    write_csv_dictrows(OUT_ISSUES, issue_rows_out, fieldnames=issue_cols)
+    print("OK:", OUT_ISSUES)
 
-    #  Export anexos (tabela separada)
-    attachments_df.to_csv(
-        OUT_ATTACHMENTS,
-        index=False,
-        sep=";",
-        encoding="utf-8-sig",
-        quoting=csv.QUOTE_ALL,
-        lineterminator="\n"
-    )
-    print("OK:", OUT_ATTACHMENTS)
+    # 7) Export anexos (robusto + schema fixo)
+    # garante que mesmo sem anexos o CSV sai com header correto
+    attach_rows_out = []
+    for r in attach_rows:
+        rr = {c: r.get(c) for c in ATTACH_COLS}
+        attach_rows_out.append(rr)
 
-    # Parquet (issues)
+    write_csv_dictrows(OUT_ATTACH, attach_rows_out, fieldnames=ATTACH_COLS)
+    print("OK:", OUT_ATTACH)
+
+    # 8) Parquet (issues) opcional
     try:
-        df.to_parquet(OUT_PARQUET, index=False)
+        df_issues.to_parquet(OUT_PARQUET, index=False)
         print("OK:", OUT_PARQUET)
     except Exception as e:
         print("Parquet falhou (instale pyarrow). Erro:", e)
 
-    #  baixar anexos
-    if DOWNLOAD_ATTACHMENTS and not attachments_df.empty:
-        download_attachments(attachments_df, ATTACHMENTS_DIR)
+    # 9) Download físico (opcional)
+    if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
+        download_attachments(attach_rows_out, ATTACHMENTS_DIR)
 
     print("Board:", "https://cnpem.atlassian.net/jira/software/c/projects/IINFRA/boards/587")
+
 
 if __name__ == "__main__":
     main()
