@@ -6,15 +6,26 @@ import os
 import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
+import keyring
 # =========================
 # CONFIG
 # =========================
-BASE = "https://cnpem.atlassian.net"
-EMAIL = "gabriel.torres@cnpem.br"
-API_TOKEN = "ATATT3xFfGF00bsJsmYL9rtzwi8ta0v0Bz0LOxauulCelUINGQ52eKb_O2siFiZoexl75tmuEz8F6PEOJTGLYDK1XtSvjC_Aix1jacXXKpy1Bw89EirDgGHL843F9JLX3e-cdPpY3rpHLOH3I5bQBKvCt8foQBdAErPqo25Nne3hhgWaADHfRbk=5ECB886B"
+
+SERVICE = "jira_cnpem"
+
+EMAIL = keyring.get_password(SERVICE, "email")
+BASE = keyring.get_password(SERVICE, "base")
+API_TOKEN = keyring.get_password(SERVICE, EMAIL if EMAIL else "")
+
+if not EMAIL or not BASE or not API_TOKEN:
+    raise RuntimeError(
+        "Credenciais do Jira não encontradas no keyring. "
+        "Execute o script de setup."
+    )
+
 
 JQL = "project = IINFRA ORDER BY Rank ASC"
-PAGE_SIZE = 100
+PAGE_SIZE = 200
 
 OUT_FIELDS = "iinfra_field_dictionary.csv"
 OUT_CSV = "iinfra_organizado.csv"
