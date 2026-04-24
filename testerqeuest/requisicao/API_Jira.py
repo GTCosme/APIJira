@@ -2,7 +2,7 @@ import csv
 import json
 import os
 import re
-import time
+import time 
 import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
@@ -21,9 +21,8 @@ if not EMAIL or not BASE or not API_TOKEN:
     raise RuntimeError(
         "Credenciais do Jira não encontradas no keyring.\n"
         "Esperado no keyring:\n"
-        f"- service={SERVICE}, username=email  -> value=<seu email>\n"
-        f"- service={SERVICE}, username=base   -> value=https://cnpem.atlassian.net\n"
-        f"- service={SERVICE}, username=<email> -> value=<api_token>\n"
+        "Execute o script keyring."
+       
     )
 
 JQL = "project = IINFRA ORDER BY Rank ASC"
@@ -100,6 +99,9 @@ headers = {"Accept": "application/json"}
 # HELPERS: HTTP
 # =========================================================
 def req_json(method, url, *, params=None, max_retries=6):
+    """
+    Busca e trata erros HTTP
+    """
     for attempt in range(max_retries):
         r = requests.request(method, url, headers=headers, auth=auth, params=params)
 
@@ -120,16 +122,16 @@ def req_json(method, url, *, params=None, max_retries=6):
             r.raise_for_status()
 
         return r.json()
-
+    
     r.raise_for_status()
 
 
 def jira_get(path, params=None):
     return req_json("GET", f"{BASE}{path}", params=params)
 
-# =========================================================
-# HELPERS: NORMALIZAÇÃO
-# =========================================================
+""" HELPERS: NORMALIZAÇÃO"""
+
+
 def _sanitize_cell(v):
     """Remove CR/LF e normaliza nulos -> string vazia.
     Isso evita linha quebrada e deslocamento de colunas no CSV.
@@ -306,14 +308,12 @@ def download_attachments(attach_rows, out_dir):
                 if chunk:
                     f.write(chunk)
 
-    print("Download concluído em:", out_dir)
+    
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
-    print("BASE:", BASE)
-    print("EMAIL:", EMAIL)
     print("JQL:", JQL)
 
     # 1) Catálogo de campos (dicionário)
@@ -436,13 +436,13 @@ def main():
         df_issues.to_parquet(OUT_PARQUET, index=False)
         print("OK:", OUT_PARQUET)
     except Exception as e:
-        print("Parquet falhou (instale pyarrow). Erro:", e)
+        print("Parquet falhou. Erro:", e)
 
     # 9) Download físico (opcional)
     if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
         download_attachments(attach_rows_out, ATTACHMENTS_DIR)
 
-    print("Board:", "https://cnpem.atlassian.net/jira/software/c/projects/IINFRA/boards/587")
+
 
 
 if __name__ == "__main__":
