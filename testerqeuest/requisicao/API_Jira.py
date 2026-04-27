@@ -2,7 +2,7 @@ import csv
 import json
 import os
 import re
-import time 
+import time
 import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
@@ -22,7 +22,6 @@ if not EMAIL or not BASE or not API_TOKEN:
         "Credenciais do Jira não encontradas no keyring.\n"
         "Esperado no keyring:\n"
         "Execute o script keyring."
-       
     )
 
 JQL = "project = IINFRA ORDER BY Rank ASC"
@@ -122,16 +121,16 @@ def req_json(method, url, *, params=None, max_retries=6):
             r.raise_for_status()
 
         return r.json()
-    
+
     r.raise_for_status()
 
 
 def jira_get(path, params=None):
     return req_json("GET", f"{BASE}{path}", params=params)
 
-""" HELPERS: NORMALIZAÇÃO"""
-
-
+# =========================================================
+# HELPERS: NORMALIZAÇÃO
+# =========================================================
 def _sanitize_cell(v):
     """Remove CR/LF e normaliza nulos -> string vazia.
     Isso evita linha quebrada e deslocamento de colunas no CSV.
@@ -308,8 +307,6 @@ def download_attachments(attach_rows, out_dir):
                 if chunk:
                     f.write(chunk)
 
-    
-
 # =========================================================
 # MAIN
 # =========================================================
@@ -389,9 +386,16 @@ def main():
         row["Orçamento_liberado_ano_num"] = parse_ptbr_number(row.get("Orçamento liberado no ano (R$)"))
         row["Execução_percent_num"] = parse_ptbr_number(row.get("% Execução"))
 
-        # anexos
+        # =====================================================
+        # ANEXOS (ALTERAÇÃO AQUI)
+        # - mantém 1 linha por anexo
+        # - mas contentUrl vira o ZIP com todos anexos da issue
+        # =====================================================
         attachments = f.get("attachment") or []
         row["attachment_count"] = len(attachments)
+
+        issue_id = issue.get("id")  # necessário para /secure/attachmentzip/{issue_id}.zip
+        zip_url = f"{BASE}/secure/attachmentzip/{issue_id}.zip" if issue_id else None
 
         for a in attachments:
             attach_rows.append({
@@ -403,7 +407,8 @@ def main():
                 "size": a.get("size"),
                 "created": a.get("created"),
                 "author": (a.get("author") or {}).get("displayName"),
-                "contentUrl": a.get("content"),
+                # SUBSTITUI o content do anexo pelo ZIP (fallback para o content original se zip_url não existir)
+                "contentUrl": zip_url if zip_url else a.get("content"),
                 "thumbnailUrl": a.get("thumbnail"),
             })
 
@@ -441,8 +446,6 @@ def main():
     # 9) Download físico (opcional)
     if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
         download_attachments(attach_rows_out, ATTACHMENTS_DIR)
-
-
 
 
 if __name__ == "__main__":
