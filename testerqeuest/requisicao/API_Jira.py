@@ -27,10 +27,11 @@ if not EMAIL or not BASE or not API_TOKEN:
 JQL = "project = IINFRA ORDER BY Rank ASC"
 PAGE_SIZE = 200
 
-OUT_FIELDS = "iinfra_field_dictionary.csv"
-OUT_ISSUES = "iinfra_organizado.csv"
-OUT_ATTACH = "iinfra_attachments.csv"
-OUT_PARQUET = "iinfra_organizado.parquet"
+OUT_FIELDS   = "iinfra_field_dictionary.csv"
+OUT_ISSUES   = "iinfra_organizado.csv"
+OUT_ATTACH   = "iinfra_attachments.csv"
+OUT_PARQUET  = "iinfra_organizado.parquet"
+OUT_COMMENTS = "iinfra_comments.csv"
 
 DOWNLOAD_ATTACHMENTS = False
 ATTACHMENTS_DIR = "attachments_download"
@@ -89,6 +90,16 @@ ATTACH_COLS = [
     "author",
     "contentUrl",
     "thumbnailUrl",
+]
+
+# Schema fixo para comentários
+COMMENT_COLS = [
+    "issueKey",
+    "commentId",
+    "author",
+    "created",
+    "updated",
+    "body_text",
 ]
 
 auth = HTTPBasicAuth(EMAIL, API_TOKEN)
@@ -185,7 +196,7 @@ def parse_ptbr_number(s):
 
 
 def adf_to_text(node):
-    """Extrai texto simples de ADF (description)."""
+    """Extrai texto simples de ADF (description/comments)."""
     if node is None:
         return ""
     if isinstance(node, list):
@@ -255,7 +266,7 @@ def fetch_fields_catalog():
     return all_fields
 
 
-def search_all_issues(jql, fields_csv, expand="names,schema", page_size=100):
+def search_all_issues(jql, fields_csv, expand="names,schema,comments", page_size=100):
     """GET /rest/api/3/search/jql com nextPageToken"""
     issues = []
     next_token = None
@@ -335,7 +346,7 @@ def main():
     system_fields = [
         "summary", "description", "status", "issuetype", "priority",
         "assignee", "reporter", "created", "updated", "duedate", "project",
-        "attachment",
+        "attachment", "comment",
     ]
     custom_field_ids = [name_to_id.get(nm) for nm in WANTED_UI_FIELDS if name_to_id.get(nm)]
     fields_list = system_fields + custom_field_ids
@@ -345,12 +356,13 @@ def main():
     fields_list = [f for f in fields_list if not (f in seen or seen.add(f))]
     fields_csv = ",".join(fields_list)
 
-    # 3) Busca issues
-    issues = search_all_issues(JQL, fields_csv, expand="names,schema", page_size=PAGE_SIZE)
+    # 3) Busca issues (já com comentários via expand)
+    issues = search_all_issues(JQL, fields_csv, expand="names,schema,comments", page_size=PAGE_SIZE)
 
-    # 4) Monta linhas de issues + anexos
-    issue_rows = []
-    attach_rows = []
+    # 4) Monta linhas de issues + anexos + comentários
+    issue_rows   = []
+    attach_rows  = []
+    comment_rows = []
 
     for issue in issues:
         f = issue.get("fields", {})
@@ -379,17 +391,15 @@ def main():
             row[ui_name] = to_scalar(f.get(fid)) if fid else None
 
         # numéricos prontos p/ BI
-        row["Orçamento_num"] = parse_ptbr_number(row.get("Orçamento (R$)"))
-        row["Expense_num"] = parse_ptbr_number(row.get("Expense (R$)"))
-        row["Balance_num"] = parse_ptbr_number(row.get("Balance (R$)"))
-        row["Orçamento_revisado_num"] = parse_ptbr_number(row.get("Orçamento revisado (R$)"))
+        row["Orçamento_num"]              = parse_ptbr_number(row.get("Orçamento (R$)"))
+        row["Expense_num"]                = parse_ptbr_number(row.get("Expense (R$)"))
+        row["Balance_num"]                = parse_ptbr_number(row.get("Balance (R$)"))
+        row["Orçamento_revisado_num"]     = parse_ptbr_number(row.get("Orçamento revisado (R$)"))
         row["Orçamento_liberado_ano_num"] = parse_ptbr_number(row.get("Orçamento liberado no ano (R$)"))
-        row["Execução_percent_num"] = parse_ptbr_number(row.get("% Execução"))
+        row["Execução_percent_num"]       = parse_ptbr_number(row.get("% Execução"))
 
         # =====================================================
-        # ANEXOS (ALTERAÇÃO AQUI)
-        # - mantém 1 linha por anexo
-        # - mas contentUrl vira o ZIP com todos anexos da issue
+        # ANEXOS
         # =====================================================
         attachments = f.get("attachment") or []
         row["attachment_count"] = len(attachments)
@@ -403,20 +413,37 @@ def main():
                 "attachmentId": a.get("id"),
                 "filename": a.get("filename"),
                 "mimeType": a.get("mimeType"),
-                # size: manter como valor simples (vai como texto no CSV; você tipa no Power BI se quiser)
                 "size": a.get("size"),
                 "created": a.get("created"),
                 "author": (a.get("author") or {}).get("displayName"),
-                # SUBSTITUI o content do anexo pelo ZIP (fallback para o content original se zip_url não existir)
                 "contentUrl": zip_url if zip_url else a.get("content"),
                 "thumbnailUrl": a.get("thumbnail"),
+            })
+
+        # =====================================================
+        # COMENTÁRIOS
+        # =====================================================
+        comments_block = (f.get("comment") or {})
+        comments_list  = comments_block.get("comments") or []
+
+        for c in comments_list:
+            body = c.get("body")
+            body_text = description_to_text(body)
+            comment_rows.append({
+                "issueKey":  key,
+                "commentId": c.get("id"),
+                "author":    (c.get("author") or {}).get("displayName"),
+                "created":   c.get("created"),
+                "updated":   c.get("updated"),
+                "body_text": body_text,
             })
 
         issue_rows.append(row)
 
     # 5) Ordena colunas das issues (as que faltarem vão pro final)
     df_issues = pd.DataFrame(issue_rows)
-    issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
+    issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + \
+                 [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
     df_issues = df_issues[issue_cols]
 
     # Converte de volta para rows (dicts) pra escrever com DictWriter robusto
@@ -427,7 +454,6 @@ def main():
     print("OK:", OUT_ISSUES)
 
     # 7) Export anexos (robusto + schema fixo)
-    # garante que mesmo sem anexos o CSV sai com header correto
     attach_rows_out = []
     for r in attach_rows:
         rr = {c: r.get(c) for c in ATTACH_COLS}
@@ -436,14 +462,23 @@ def main():
     write_csv_dictrows(OUT_ATTACH, attach_rows_out, fieldnames=ATTACH_COLS)
     print("OK:", OUT_ATTACH)
 
-    # 8) Parquet (issues) opcional
+    # 8) Export comentários (schema fixo)
+    comment_rows_out = []
+    for r in comment_rows:
+        rr = {c: r.get(c) for c in COMMENT_COLS}
+        comment_rows_out.append(rr)
+
+    write_csv_dictrows(OUT_COMMENTS, comment_rows_out, fieldnames=COMMENT_COLS)
+    print("OK:", OUT_COMMENTS)
+
+    # 9) Parquet (issues) opcional
     try:
         df_issues.to_parquet(OUT_PARQUET, index=False)
         print("OK:", OUT_PARQUET)
     except Exception as e:
         print("Parquet falhou. Erro:", e)
 
-    # 9) Download físico (opcional)
+    # 10) Download físico (opcional)
     if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
         download_attachments(attach_rows_out, ATTACHMENTS_DIR)
 
