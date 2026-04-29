@@ -58,7 +58,7 @@ WANTED_UI_FIELDS = [
     "servicedesk-approvals",
 ]
 
-# Ordem final das colunas do CSV de issues
+# Ordem final das colunas do CSV de issues (NÃO ALTERADA)
 FINAL_COL_ORDER = [
     "key", "url",
     "project", "issuetype", "status", "priority",
@@ -148,7 +148,6 @@ def _sanitize_cell(v):
     """
     if v is None:
         return ""
-    # pandas NA / nan
     try:
         if pd.isna(v):
             return ""
@@ -179,20 +178,57 @@ def to_scalar(v):
 
 
 def parse_ptbr_number(s):
-    """Converte '1.234.567,89' / '150.000,00' / '57%' -> float"""
+    """
+    Converte:
+      - '1.234.567,89' -> 1234567.89
+      - '150.000,00'   -> 150000.00
+      - '150.000'      -> 150000.00   (pt-BR milhar sem decimais)
+      - '57%'          -> 57.0
+    """
     if s is None:
         return None
     s = str(s).strip()
     if not s or s.lower() in ("nan", "none", "null"):
         return None
+
     s = s.replace("R$", "").replace("%", "").strip()
     s = re.sub(r"[^0-9\-,\.]", "", s)
+    if not s:
+        return None
+
     if "," in s:
+        # decimal pt-BR
         s = s.replace(".", "").replace(",", ".")
+    else:
+        # sem vírgula: pode ser milhar pt-BR (ex.: 150.000 / 1.234.567)
+        if re.fullmatch(r"-?\d{1,3}(\.\d{3})+", s):
+            s = s.replace(".", "")
+
     try:
         return float(s)
     except ValueError:
         return None
+
+
+def fmt_ptbr_money(x, ndigits=2):
+    """Formata número como pt-BR: 150.000,00 (para CSV ficar igual ao texto)."""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+
+    try:
+        v = float(x)
+    except Exception:
+        return ""
+
+    # Ex: "150,000.00" -> "150.000,00"
+    s = f"{v:,.{ndigits}f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return s
 
 
 def adf_to_text(node):
@@ -223,12 +259,11 @@ def description_to_text(desc):
 # =========================================================
 # CSV WRITER (ROBUSTO)
 # =========================================================
-def write_csv_dictrows(path, rows, fieldnames):
+def write_csv_dictrows(path, rows, fieldnames, formatters=None):
     """Escreve CSV determinístico:
     - sempre mesmas colunas e mesma ordem
     - QUOTE_ALL
-    - lineterminator '\n'
-    - newline='' (evita linhas em branco no Windows)
+    - permite formatar colunas específicas (sem mudar nome/ordem)
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -245,7 +280,12 @@ def write_csv_dictrows(path, rows, fieldnames):
         )
         w.writeheader()
         for r in rows:
-            out = {k: _sanitize_cell(r.get(k)) for k in fieldnames}
+            out = {}
+            for k in fieldnames:
+                v = r.get(k)
+                if formatters and k in formatters:
+                    v = formatters[k](v)
+                out[k] = _sanitize_cell(v)
             w.writerow(out)
 
 # =========================================================
@@ -390,13 +430,13 @@ def main():
             fid = name_to_id.get(ui_name)
             row[ui_name] = to_scalar(f.get(fid)) if fid else None
 
-        # numéricos prontos p/ BI
-        row["Orçamento_num"]              = parse_ptbr_number(row.get("Orçamento (R$)"))
-        row["Expense_num"]                = parse_ptbr_number(row.get("Expense (R$)"))
-        row["Balance_num"]                = parse_ptbr_number(row.get("Balance (R$)"))
-        row["Orçamento_revisado_num"]     = parse_ptbr_number(row.get("Orçamento revisado (R$)"))
+        # numéricos prontos p/ BI (valores numéricos)
+        row["Orçamento_num"] = parse_ptbr_number(row.get("Orçamento (R$)"))
+        row["Expense_num"] = parse_ptbr_number(row.get("Expense (R$)"))
+        row["Balance_num"] = parse_ptbr_number(row.get("Balance (R$)"))
+        row["Orçamento_revisado_num"] = parse_ptbr_number(row.get("Orçamento revisado (R$)"))
         row["Orçamento_liberado_ano_num"] = parse_ptbr_number(row.get("Orçamento liberado no ano (R$)"))
-        row["Execução_percent_num"]       = parse_ptbr_number(row.get("% Execução"))
+        row["Execução_percent_num"] = parse_ptbr_number(row.get("% Execução"))
 
         # =====================================================
         # ANEXOS
@@ -440,20 +480,24 @@ def main():
 
         issue_rows.append(row)
 
-    # 5) Ordena colunas das issues (as que faltarem vão pro final)
+    # 5) Ordena colunas das issues (as que faltarem vão pro final) - NÃO ALTERADO
     df_issues = pd.DataFrame(issue_rows)
-    issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + \
-                 [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
+    issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
     df_issues = df_issues[issue_cols]
 
-    # Converte de volta para rows (dicts) pra escrever com DictWriter robusto
     issue_rows_out = df_issues.to_dict(orient="records")
 
-    # 6) Export issues (robusto)
-    write_csv_dictrows(OUT_ISSUES, issue_rows_out, fieldnames=issue_cols)
+    # 6) Export issues
+    # >>> Aqui que a gente "igual" ao texto pt-BR (sem mudar colunas):
+    issue_formatters = {
+        "Orçamento_num": lambda v: fmt_ptbr_money(v, ndigits=2),
+        "Orçamento_revisado_num": lambda v: fmt_ptbr_money(v, ndigits=2),
+    }
+
+    write_csv_dictrows(OUT_ISSUES, issue_rows_out, fieldnames=issue_cols, formatters=issue_formatters)
     print("OK:", OUT_ISSUES)
 
-    # 7) Export anexos (robusto + schema fixo)
+    # 7) Export anexos (schema fixo)
     attach_rows_out = []
     for r in attach_rows:
         rr = {c: r.get(c) for c in ATTACH_COLS}
@@ -471,7 +515,7 @@ def main():
     write_csv_dictrows(OUT_COMMENTS, comment_rows_out, fieldnames=COMMENT_COLS)
     print("OK:", OUT_COMMENTS)
 
-    # 9) Parquet (issues) opcional
+    # 9) Parquet (issues) opcional (continua numérico, porque a formatação foi só no CSV)
     try:
         df_issues.to_parquet(OUT_PARQUET, index=False)
         print("OK:", OUT_PARQUET)
@@ -481,7 +525,6 @@ def main():
     # 10) Download físico (opcional)
     if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
         download_attachments(attach_rows_out, ATTACHMENTS_DIR)
-
 
 if __name__ == "__main__":
     main()
