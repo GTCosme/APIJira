@@ -27,11 +27,13 @@ if not EMAIL or not BASE or not API_TOKEN:
 JQL = "project = IINFRA ORDER BY Rank ASC"
 PAGE_SIZE = 200
 
-OUT_FIELDS   = "iinfra_field_dictionary.csv"
-OUT_ISSUES   = "iinfra_organizado.csv"
-OUT_ATTACH   = "iinfra_attachments.csv"
-OUT_PARQUET  = "iinfra_organizado.parquet"
-OUT_COMMENTS = "iinfra_comments.csv"
+BASE_OUT_DIR = r"C:\Users\gabriel.torres\OneDrive - CNPEM - Centro Nacional de Pesquisa em Energia e Materiais\Documentos\DAI - PMO DAI\8.RELATÓRIOS\PortfólioDAI"
+
+OUT_FIELDS = os.path.join(BASE_OUT_DIR, "iinfra_field_dictionary.csv")
+OUT_ISSUES = os.path.join(BASE_OUT_DIR, "iinfra_organizado.csv")
+OUT_PARQUET = os.path.join(BASE_OUT_DIR, "iinfra_organizado.parquet")
+OUT_ATTACH = os.path.join(BASE_OUT_DIR, "iinfra_attachments.csv")
+OUT_COMMENTS = os.path.join(BASE_OUT_DIR,"iinfra_comments.csv") 
 
 DOWNLOAD_ATTACHMENTS = False
 ATTACHMENTS_DIR = "attachments_download"
