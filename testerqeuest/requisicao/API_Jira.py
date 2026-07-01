@@ -30,8 +30,8 @@ PAGE_SIZE = 200
 BASE_OUT_DIR = r"C:\Users\gabriel.torres\OneDrive - CNPEM - Centro Nacional de Pesquisa em Energia e Materiais\Documentos\DAI - PMO DAI\8.RELATÓRIOS\PortfólioDAI"
 
 OUT_FIELDS = os.path.join(BASE_OUT_DIR, "iinfra_field_dictionary.csv")
-OUT_ISSUES = os.path.join(BASE_OUT_DIR, "iinfra_organizado.csv")
-OUT_PARQUET = os.path.join(BASE_OUT_DIR, "iinfra_organizado.parquet")
+OUT_ISSUES = os.path.join(BASE_OUT_DIR, "iinfra.csv")
+OUT_PARQUET = os.path.join(BASE_OUT_DIR, "iinfra.parquet")
 OUT_ATTACH = os.path.join(BASE_OUT_DIR, "iinfra_attachments.csv")
 OUT_COMMENTS = os.path.join(BASE_OUT_DIR,"iinfra_comments.csv") 
 
