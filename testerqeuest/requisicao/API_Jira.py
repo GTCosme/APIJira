@@ -6,6 +6,7 @@ import time
 import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import keyring
 
 # =========================================================
@@ -26,6 +27,7 @@ if not EMAIL or not BASE or not API_TOKEN:
 
 JQL = "project = IINFRA ORDER BY Rank ASC"
 PAGE_SIZE = 200
+MAX_WORKERS = 10
 
 BASE_OUT_DIR = r"C:\Users\gabriel.torres\OneDrive - CNPEM - Centro Nacional de Pesquisa em Energia e Materiais\Documentos\DAI - PMO DAI\8.RELATÓRIOS\PortfólioDAI"
 
@@ -33,7 +35,7 @@ OUT_FIELDS = os.path.join(BASE_OUT_DIR, "iinfra_field_dictionary.csv")
 OUT_ISSUES = os.path.join(BASE_OUT_DIR, "iinfra.csv")
 OUT_PARQUET = os.path.join(BASE_OUT_DIR, "iinfra.parquet")
 OUT_ATTACH = os.path.join(BASE_OUT_DIR, "iinfra_attachments.csv")
-OUT_COMMENTS = os.path.join(BASE_OUT_DIR,"iinfra_comments.csv") 
+OUT_COMMENTS = os.path.join(BASE_OUT_DIR, "iinfra_comments.csv")
 
 DOWNLOAD_ATTACHMENTS = False
 ATTACHMENTS_DIR = "attachments_download"
@@ -49,7 +51,6 @@ WANTED_UI_FIELDS = [
     "Orçamento revisado (R$)",
     "Orçamento liberado no ano (R$)",
     "% Execução",
-    "Criteria - Indicators",
     "Indicador TA",
     "Work type id",
     "Observações",
@@ -57,10 +58,9 @@ WANTED_UI_FIELDS = [
     "Epic Link",
     "Flagged",
     "Story Points",
-    "servicedesk-approvals",
 ]
 
-# Ordem final das colunas do CSV de issues (NÃO ALTERADA)
+# Ordem final das colunas do CSV de issues
 FINAL_COL_ORDER = [
     "key", "url",
     "project", "issuetype", "status", "priority",
@@ -78,6 +78,7 @@ FINAL_COL_ORDER = [
     "created", "updated",
     "summary", "description_text",
     "Observações",
+    "Remote Links",
     "attachment_count",
 ]
 
@@ -102,6 +103,13 @@ COMMENT_COLS = [
     "created",
     "updated",
     "body_text",
+]
+
+# Colunas numéricas para limpeza de tipo (evita erro no Power BI)
+NUMERIC_COLS = [
+    "Orçamento_num", "Expense_num", "Balance_num",
+    "Orçamento_revisado_num", "Orçamento_liberado_ano_num",
+    "Execução_percent_num", "attachment_count",
 ]
 
 auth = HTTPBasicAuth(EMAIL, API_TOKEN)
@@ -259,6 +267,40 @@ def description_to_text(desc):
     return str(desc)
 
 # =========================================================
+# HELPERS: REMOTE LINKS (paralelo)
+# =========================================================
+def _fetch_remote_links_single(issue_key):
+    """Busca remote links de um issue. Retorna (issue_key, resultado)."""
+    try:
+        data = jira_get(f"/rest/api/3/issue/{issue_key}/remotelink")
+        if not data:
+            return (issue_key, None)
+        links = []
+        for link in data:
+            obj = link.get("object", {})
+            title = obj.get("title", "").strip()
+            url = obj.get("url", "").strip()
+            if url:
+                links.append(f"{title}: {url}" if title else url)
+        return (issue_key, " | ".join(links) if links else None)
+    except Exception:
+        return (issue_key, None)
+
+
+def fetch_remote_links_batch(issue_keys, max_workers=MAX_WORKERS):
+    """Busca remote links de múltiplos issues em paralelo."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_remote_links_single, key): key
+            for key in issue_keys
+        }
+        for future in as_completed(futures):
+            issue_key, links = future.result()
+            results[issue_key] = links
+    return results
+
+# =========================================================
 # CSV WRITER (ROBUSTO)
 # =========================================================
 def write_csv_dictrows(path, rows, fieldnames, formatters=None):
@@ -401,7 +443,11 @@ def main():
     # 3) Busca issues (já com comentários via expand)
     issues = search_all_issues(JQL, fields_csv, expand="names,schema,comments", page_size=PAGE_SIZE)
 
-    # 4) Monta linhas de issues + anexos + comentários
+    # 4) Busca remote links em PARALELO
+    all_keys = [issue.get("key") for issue in issues if issue.get("key")]
+    remote_links_map = fetch_remote_links_batch(all_keys, max_workers=MAX_WORKERS)
+
+    # 5) Monta linhas de issues + anexos + comentários
     issue_rows   = []
     attach_rows  = []
     comment_rows = []
@@ -441,12 +487,17 @@ def main():
         row["Execução_percent_num"] = parse_ptbr_number(row.get("% Execução"))
 
         # =====================================================
+        # REMOTE LINKS (já buscado em paralelo)
+        # =====================================================
+        row["Remote Links"] = remote_links_map.get(key)
+
+        # =====================================================
         # ANEXOS
         # =====================================================
         attachments = f.get("attachment") or []
         row["attachment_count"] = len(attachments)
 
-        issue_id = issue.get("id")  # necessário para /secure/attachmentzip/{issue_id}.zip
+        issue_id = issue.get("id")
         zip_url = f"{BASE}/secure/attachmentzip/{issue_id}.zip" if issue_id else None
 
         for a in attachments:
@@ -482,15 +533,19 @@ def main():
 
         issue_rows.append(row)
 
-    # 5) Ordena colunas das issues (as que faltarem vão pro final) - NÃO ALTERADO
+    # 6) Ordena colunas das issues + limpeza de tipos numéricos
     df_issues = pd.DataFrame(issue_rows)
+
+    for col in NUMERIC_COLS:
+        if col in df_issues.columns:
+            df_issues[col] = pd.to_numeric(df_issues[col], errors="coerce")
+
     issue_cols = [c for c in FINAL_COL_ORDER if c in df_issues.columns] + [c for c in df_issues.columns if c not in FINAL_COL_ORDER]
     df_issues = df_issues[issue_cols]
 
     issue_rows_out = df_issues.to_dict(orient="records")
 
-    # 6) Export issues
-    # >>> Aqui que a gente "igual" ao texto pt-BR (sem mudar colunas):
+    # 7) Export issues
     issue_formatters = {
         "Orçamento_num": lambda v: fmt_ptbr_money(v, ndigits=2),
         "Orçamento_revisado_num": lambda v: fmt_ptbr_money(v, ndigits=2),
@@ -499,7 +554,7 @@ def main():
     write_csv_dictrows(OUT_ISSUES, issue_rows_out, fieldnames=issue_cols, formatters=issue_formatters)
     print("OK:", OUT_ISSUES)
 
-    # 7) Export anexos (schema fixo)
+    # 8) Export anexos (schema fixo)
     attach_rows_out = []
     for r in attach_rows:
         rr = {c: r.get(c) for c in ATTACH_COLS}
@@ -508,7 +563,7 @@ def main():
     write_csv_dictrows(OUT_ATTACH, attach_rows_out, fieldnames=ATTACH_COLS)
     print("OK:", OUT_ATTACH)
 
-    # 8) Export comentários (schema fixo)
+    # 9) Export comentários (schema fixo)
     comment_rows_out = []
     for r in comment_rows:
         rr = {c: r.get(c) for c in COMMENT_COLS}
@@ -517,14 +572,14 @@ def main():
     write_csv_dictrows(OUT_COMMENTS, comment_rows_out, fieldnames=COMMENT_COLS)
     print("OK:", OUT_COMMENTS)
 
-    # 9) Parquet (issues) opcional (continua numérico, porque a formatação foi só no CSV)
+    # 10) Parquet (issues) opcional (continua numérico, porque a formatação foi só no CSV)
     try:
         df_issues.to_parquet(OUT_PARQUET, index=False)
         print("OK:", OUT_PARQUET)
     except Exception as e:
         print("Parquet falhou. Erro:", e)
 
-    # 10) Download físico (opcional)
+    # 11) Download físico (opcional)
     if DOWNLOAD_ATTACHMENTS and len(attach_rows_out) > 0:
         download_attachments(attach_rows_out, ATTACHMENTS_DIR)
 
