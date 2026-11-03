@@ -270,22 +270,98 @@ def description_to_text(desc):
 # HELPERS: REMOTE LINKS (paralelo)
 # =========================================================
 def _fetch_remote_links_single(issue_key):
-    """Busca remote links de um issue. Retorna (issue_key, resultado)."""
+    """
+    Busca os remote links do issue.
+
+    Alteração solicitada:
+    prioriza o relatório Atual_AAAA-MM.pdf com o maior ano/mês,
+    identificado pelo título ou pela URL.
+
+    Mantém as demais regras do script original.
+    """
+    from urllib.parse import unquote
+
+    padrao_datado = re.compile(
+        r"(?<![a-z0-9])atual[ _+\-]*(\d{4})[-_]"
+        r"(0[1-9]|1[0-2])\.pdf(?=$|[\s?#&/])",
+        re.IGNORECASE,
+    )
+
     try:
-        data = jira_get(f"/rest/api/3/issue/{issue_key}/remotelink")
-        if not data:
+        data = jira_get(
+            f"/rest/api/3/issue/{issue_key}/remotelink"
+        )
+
+        if not data or len(data) == 0:
             return (issue_key, None)
-        links = []
+
+        datados = []
+        atual_links = []
+        sharepoint_links = []
+        other_external_links = []
+
         for link in data:
             obj = link.get("object", {})
-            title = obj.get("title", "").strip()
-            url = obj.get("url", "").strip()
-            if url:
-                links.append(f"{title}: {url}" if title else url)
-        return (issue_key, " | ".join(links) if links else None)
-    except Exception:
-        return (issue_key, None)
+            title = (obj.get("title") or "").strip().lower()
+            url = (obj.get("url") or "").strip()
+            url_lower = url.lower()
 
+            if not url:
+                continue
+
+            # NOVO: identifica a data no título ou na URL.
+            texto = f"{unquote(title)}\n{unquote(url)}"
+
+            for ano, mes in padrao_datado.findall(texto):
+                if int(ano) > 0:
+                    datados.append(
+                        ((int(ano), int(mes)), url)
+                    )
+
+            # Mantém a identificação original de "atual".
+            if "atual" in title or "atual" in url_lower:
+                atual_links.append(url)
+
+            # Mantém a separação original dos links.
+            if (
+                "sharepoint.com" in url_lower
+                or "1drv.ms" in url_lower
+            ):
+                sharepoint_links.append(url)
+
+            elif "atlassian.net" not in url_lower:
+                other_external_links.append(url)
+
+        # NOVO: prioridade para o relatório datado mais recente.
+        if datados:
+            mais_recente = max(
+                datados,
+                key=lambda item: item[0],
+            )
+            return (issue_key, mais_recente[1])
+
+        # A partir daqui, mantém as alternativas originais.
+        if atual_links:
+            return (issue_key, atual_links[0])
+
+        if sharepoint_links:
+            return (issue_key, sharepoint_links[0])
+
+        if other_external_links:
+            return (issue_key, other_external_links[0])
+
+        first_url = (
+            data[0].get("object", {}).get("url") or ""
+        ).strip()
+
+        return (
+            issue_key,
+            first_url if first_url else None,
+        )
+
+    except Exception as e:
+        print(f"[Erro Remote Link] {issue_key}: {e}")
+        return (issue_key, None)
 
 def fetch_remote_links_batch(issue_keys, max_workers=MAX_WORKERS):
     """Busca remote links de múltiplos issues em paralelo."""
@@ -489,8 +565,38 @@ def main():
         # =====================================================
         # REMOTE LINKS (já buscado em paralelo)
         # =====================================================
-        row["Remote Links"] = remote_links_map.get(key)
+               # Busca o relatório datado entre os anexos já carregados.
+        relatorios_datados = []
 
+        for anexo in f.get("attachment") or []:
+            nome = anexo.get("filename") or ""
+
+            match = re.fullmatch(
+                r"atual[ _-]*(\d{4})-(0[1-9]|1[0-2])\.pdf",
+                nome,
+                re.IGNORECASE,
+            )
+
+            if match and anexo.get("content"):
+                ordem = (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    anexo.get("created") or "",
+                )
+
+                relatorios_datados.append(
+                    (ordem, anexo["content"])
+                )
+
+        if relatorios_datados:
+            # Preenche a mesma coluna com o link do PDF datado.
+            row["Remote Links"] = max(
+                relatorios_datados,
+                key=lambda item: item[0],
+            )[1]
+        else:
+            # Sem anexo datado, mantém a lógica de links remotos.
+            row["Remote Links"] = remote_links_map.get(key)
         # =====================================================
         # ANEXOS
         # =====================================================
